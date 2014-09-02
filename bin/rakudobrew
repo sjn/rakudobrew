@@ -42,8 +42,15 @@ if ($arg eq 'switch') {
     }
 } elsif ($arg eq 'build') {
     my ($impl, $ver) = (shift, shift);
+    my @implementations = qw(parrot jvm moar moar_jit);
+    if (!$impl) {
+        say "Build what?";
+        say "Available implementations:";
+        map {say} @implementations;
+        exit;
+    }
     if ($impl eq 'all') {
-        for (qw(parrot jvm moar)) {
+        for (@implementations) {
             build_impl($_, $ver);
         }
     } else {
