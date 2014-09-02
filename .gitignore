@@ -1,7 +1,8 @@
 CURRENT
 parrot-*/
 jvm-*/
-moarvm-*/
+moar-*/
+moar_jit-*/
 bin/*
 !bin/rakudobrew
-CURRENT
+*~
