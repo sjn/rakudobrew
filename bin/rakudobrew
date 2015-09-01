@@ -2,45 +2,67 @@
 use strict;
 use warnings;
 use 5.010;
+use Cwd;
 use FindBin qw($Bin);
+use File::Path qw(remove_tree);
+use File::Basename qw(basename dirname);
+use Carp qw(croak);
 
 my $arg = shift // 'help';
 my $prefix = "$Bin/..";
+my $git_reference = "$prefix/git_reference" ;
 
-my $GIT = $ENV{GIT_BINARY} // 'git';
-my $RAKUDO_REPO_URL = 'https://github.com/rakudo/rakudo.git'; #Avoids problems with non-users
+unless (-d $git_reference) {
+    mkdir $git_reference;
+}
+
+my $GIT       = $ENV{GIT_BINARY} // 'git';
+my $GIT_PROTO = $ENV{GIT_PROTOCOL} // 'git';
+my $PERL5     = $^X;
+
+my %git_repos = (
+    rakudo => "$GIT_PROTO://github.com/rakudo/rakudo.git",
+    MoarVM => "$GIT_PROTO://github.com/MoarVM/MoarVM.git",
+    nqp    => "$GIT_PROTO://github.com/perl6/nqp.git",
+    panda  => "$GIT_PROTO://github.com/tadzik/panda.git",
+);
 
 my %impls = (
-    parrot => {
-        name      => "parrot",
-        weight    => 10,
-        configure => 'perl Configure.pl --backends=parrot --gen-parrot --gen-nqp',
-    },
     jvm => {
         name      => "jvm",
         weight    => 20,
-        configure => 'perl Configure.pl --backends=jvm --gen-nqp',
+        configure => "$PERL5 Configure.pl --backends=jvm --gen-nqp --git-reference=$git_reference --make-install",
+        need_repo => ['rakudo', 'nqp'],
     },
     moar => {
         name      => "moar",
         weight    => 30,
-        configure => 'perl Configure.pl --backends=moar --gen-moar',
+        configure => "$PERL5 Configure.pl --backends=moar --gen-moar --git-reference=$git_reference --make-install",
+        need_repo => ['rakudo', 'nqp', 'MoarVM'],
+    },
+    glr => {
+        name      => "glr",
+        weight    => 30,
+        configure => "git checkout glr; git pull; $PERL5 Configure.pl --backends=moar --gen-moar --git-reference=$git_reference --make-install",
+        need_repo => ['rakudo', 'nqp', 'MoarVM'],
     },
 );
 
 sub run {
-    system(@_) and die "Failed running ".$_[0]
+    system(@_) and croak "Failed running ".$_[0]
 }
 
 if ($arg eq 'switch') {
     my $impl = shift;
     switch($impl);
+} elsif ($arg eq 'nuke') {
+    my $impl = shift;
+    nuke($impl);
 } elsif ($arg eq 'rehash') {
     rehash();
 } elsif ($arg eq 'list') {
     my $cur = current() || '';
-    map { say $cur eq $_ ? "* $_" : "  $_" } list();
-    
+    map { say $cur eq $_ ? "* $_" : "  $_" } sort { $a cmp $b } list();
 } elsif ($arg eq 'list-available') {
     my ($cur_backend, $cur_rakudo) = split '-', (current() || ''), 2;
     $cur_backend |= '';
@@ -57,40 +79,54 @@ if ($arg eq 'switch') {
         say "Not running anything at the moment. Use 'rakudobrew switch' to set an implementation";
     }
 } elsif ($arg eq 'build') {
-    my ($impl, $ver) = (shift, shift);
-    my @implementations = qw(parrot jvm moar moar_jit);
-    if (!$impl) {
-        say "Build what?";
-        say "Available implementations:";
-        map {say} @implementations;
-        exit;
+    my $impl = shift;
+    my $ver = shift
+        if @ARGV && $ARGV[0] !~ /^--/;
+    my $configure_opts = '';
+    if (@ARGV && $ARGV[0] =~ /^--configure-opts=/) {
+        $configure_opts = shift;
+        $configure_opts =~ s/^\-\-configure-opts=//;
+        $configure_opts =~ s/^'//;
+        $configure_opts =~ s/'$//;
     }
-    if ($impl eq 'all') {
-        for (@implementations) {
-            build_impl($_, $ver);
+    if ($impl && $impl eq 'all') {
+        for (available_backends()) {
+            build_impl($_, $ver, $configure_opts);
         }
     } else {
-        build_impl($impl, $ver);
+        build_impl($impl, $ver, $configure_opts);
     }
 } elsif ($arg eq 'triple') {
     my ($rakudo_ver, $nqp_ver, $moar_ver) = (shift, shift, shift);
     build_triple($rakudo_ver, $nqp_ver, $moar_ver);
 } elsif ($arg eq 'build-panda') {
-    build_panda();
+    my $panda_ver = shift;
+    build_panda($panda_ver);
     rehash();
 } elsif ($arg eq 'self-upgrade') {
     self_upgrade();
+} elsif ($arg eq 'test') {
+    my $impl = shift;
+    if ($impl && $impl eq 'all') {
+        for (list()) {
+            test($_);
+        }
+    } else {
+        test($impl);
+    }
 } else {
     say "Usage:";
     say "rakudobrew current";
     say "rakudobrew list";
     say "rakudobrew list-available";
-    say "rakudobrew build " , (join "|", available_backends(), "all"), " [tag|branch|sha-1]";
-    say "rakudobrew build-panda";
+    say "rakudobrew build " , (join "|", available_backends(), "all"), " [tag|branch|sha-1]", " [--configure-opts=]";
+    say "rakudobrew build-panda [panda-ver]";
     say "rakudobrew triple [rakudo-ver [nqp-ver [moar-ver]]]";
     say "rakudobrew rehash";
     say "rakudobrew switch ", (join "|", available_backends());
+    say "rakudobrew nuke ", (join "|", available_backends());
     say "rakudobrew self-upgrade";
+    say "rakudobrew test [", (join "|", available_backends(), "all"), "]";
 }
 
 exit;
@@ -104,18 +140,38 @@ sub current {
 }
 
 sub available_rakudos {
-    my @output = qx|$GIT ls-remote --tags $RAKUDO_REPO_URL|;
+    my @output = qx|$GIT ls-remote --tags $git_repos{rakudo}|;
     my @tags = grep( m{refs/tags/([^\^]+)\^\{\}}, @output );
     return map(m{tags/([^\^]+)\^}, @tags );
 }
 
 sub list {
     opendir(my $dh, $prefix);
-    grep {/^[^.]/ && -d "$prefix/$_" && $_ ne 'bin'} readdir($dh);
+    grep {/^[^.]/ && -d "$prefix/$_"
+          && $_ ne 'bin' && $_ ne 'git_reference' && $_ ne 'panda'} readdir($dh);
 }
 
 sub switch {
     my $impl = shift;
+    match_and_run($impl, sub {
+        my $matched = shift;
+        say "Switching to $matched";
+        spurt("$prefix/CURRENT", $matched);
+        rehash();
+    })
+}
+
+sub nuke {
+    my $impl = shift;
+    match_and_run($impl, sub {
+        my $matched = shift;
+        say "Nuking $matched";
+        remove_tree("$prefix/$matched");
+    })
+}
+
+sub match_and_run {
+    my ($impl, $action) = @_;
     if (!$impl) {
         say "Switch to what?";
         say "Available builds";
@@ -123,12 +179,16 @@ sub switch {
         return;
     }
     opendir(my $dh, $prefix);
-    my @match = grep { /$impl/ } list();
+    my @match = grep { /\Q$impl/ } list();
     my ($matched, $ambiguous) = @match;
+    if ($ambiguous) {
+        my ($exact) = grep { $_ eq $impl } @match;
+        if ($exact) {
+            ($matched, $ambiguous) = $exact;
+        }
+    }
     if ($matched and not $ambiguous) {
-        say "Switching to $matched";
-        spurt("$prefix/CURRENT", $matched);
-        rehash();
+        $action->($matched);
     } elsif (@match) {
         say "Sorry, I'm not sure if you mean:";
         say $_ for @match;
@@ -142,10 +202,12 @@ sub available_backends {
 }
 
 sub build_impl {
-    my ($impl, $ver) = @_;
+    my ($impl, $ver, $configure_opts) = @_;
     unless (defined $impl) {
         say "Build what?";
-        available();
+        my ($cur) = split '-', (current() // ''), 2;
+        $cur //= '';
+        map { say $cur eq $_ ? "* $_" : "  $_" } available_backends();
         return;
     }
     if ($impl eq "panda") {
@@ -153,28 +215,29 @@ sub build_impl {
         return;
     }
     unless (exists $impls{$impl}) {
-        say "Building $impl is NYI. Well volunteered!";
+        say "Building Rakudo with backend '$impl' is NYI. Well volunteered!";
         return;
     }
-    $ver //= 'HEAD';
+    $ver //= 'nom';
     chdir $prefix;
     unless (-d "$impl-$ver") {
-        run "$GIT clone $RAKUDO_REPO_URL $impl-$ver";
+        for(@{$impls{$impl}{need_repo}}) {
+            update_git_reference($_);
+        }
+        run "$GIT clone --reference $git_reference/rakudo $git_repos{rakudo} $impl-$ver";
     }
     chdir "$impl-$ver";
-    run "$GIT pull";
-    run "$GIT checkout $ver";
-    if (-e 'Makefile') {
-        run 'make realclean';
-    }
-    run $impls{$impl}{configure};
-    if (system 'make install') {
-        if ($^O eq "darwin") {
-            run 'make install'; # try again because OS X make is stupid
-        } else {
-            die "Failed running make install";
-        }
-    }
+    run "$GIT fetch";
+    # of people say 'build somebranch', they usually mean 'build origin/somebranch'
+    my $ver_to_checkout = $ver;
+    eval {
+        run "$GIT rev-parse -q --verify origin/$ver";
+        $ver_to_checkout = "origin/$ver";
+    };
+    run "$GIT checkout $ver_to_checkout";
+
+    run $impls{$impl}{configure} . " $configure_opts";
+
     if (-d 'panda') {
         say "Updating panda as well";
         my $oldcur = current();
@@ -188,6 +251,19 @@ sub build_impl {
     say "Done, $impl-$ver built";
 }
 
+sub update_git_reference {
+    my $repo = shift;
+    my $back = cwd();
+    print "Update git reference: $repo\n";
+    chdir $git_reference;
+    unless (-d $repo) {
+        run "$GIT clone $git_repos{$repo} $repo";
+    }
+    chdir $repo;
+    run "$GIT pull";
+    chdir $back;
+}
+
 sub build_triple {
     my ($rakudo_ver, $nqp_ver, $moar_ver) = @_;
     my $impl = "moar";
@@ -197,7 +273,8 @@ sub build_triple {
     chdir $prefix;
     my $name = "$impl-$rakudo_ver-$nqp_ver-$moar_ver";
     unless (-d $name) {
-        run "$GIT clone $RAKUDO_REPO_URL $name";
+        update_git_reference('rakudo');
+        run "$GIT clone --reference $git_reference/rakudo $git_repos{rakudo} $name";
     }
     chdir $name;
     run "$GIT pull";
@@ -205,36 +282,34 @@ sub build_triple {
     if (-e 'Makefile') {
         run 'make realclean';
     }
-    
+
     unless (-d "nqp") {
-        run "$GIT clone git://github.com/perl6/nqp.git";
+        update_git_reference('nqp');
+        run "$GIT clone --reference $git_reference/nqp $git_repos{nqp}";
     }
     chdir "nqp";
     run "$GIT pull";
     run "$GIT checkout $nqp_ver";
 
     unless (-d "MoarVM") {
-        run "$GIT clone git://github.com/MoarVM/MoarVM.git";
+        update_git_reference('MoarVM');
+        run "$GIT clone --reference $git_reference/MoarVM $git_repos{MoarVM}";
     }
     chdir "MoarVM";
     run "$GIT pull";
     run "$GIT checkout $moar_ver";
-    run "perl Configure.pl --prefix=../../install";
+    run "$PERL5 Configure.pl --prefix=../../install";
     run "make install";
-    
+
     chdir "..";
-    run "perl Configure.pl --backend=moar --prefix=../install";
+    run "$PERL5 Configure.pl --backend=moar --prefix=../install";
     run "make install";
-    
+
     chdir "..";
-    run "perl Configure.pl --backend=moar";
-    
+    run "$PERL5 Configure.pl --backend=moar";
+
     if (system 'make install') {
-        if ($^O eq "darwin") {
-            run 'make install'; # try again because OS X make is stupid
-        } else {
-            die "Failed running make install";
-        }
+        die "Failed running make install";
     }
     if (-d 'panda') {
         say "Updating panda as well";
@@ -250,13 +325,16 @@ sub build_triple {
 }
 
 sub build_panda {
+    my ($panda_ver) = @_;
+    $panda_ver //= 'HEAD';
     my $impl = current();
     chdir "$prefix/$impl";
     unless (-d 'panda') {
-        run "$GIT clone git://github.com/tadzik/panda.git";
+        run "$GIT clone $git_repos{panda}";
     }
     chdir 'panda';
-    run "$GIT pull";
+    run "$GIT pull -q";
+    run "$GIT checkout -q $panda_ver";
     run "perl6 rebootstrap.pl";
     say "Done, built panda for $impl";
 }
@@ -292,34 +370,40 @@ sub rehash {
 
     sub spurt_shim {
         my ($source, $destdir) = @_;
-        my $tmpl = '#!/bin/sh
-    %s "$@"
-    ';
-        my $contents = sprintf $tmpl, $source;
-        my ($filename) = $source =~ m{/([^/]+)$};
-        spurt("$destdir/$filename", $contents);
-        chmod 0755, "$destdir/$filename";
+        my $dirname  = dirname $source;
+        my $basename = basename $source;
+
+        my $contents;
+        if ($^O =~ /win32/i) {
+            $contents = sprintf "\"%s\" %%*", $source;
+        } else {
+            my $tmpl = "#!/bin/sh\nexport PATH=%s:\$PATH\nexec %s \"\$\@\"";
+            $contents = sprintf $tmpl, $dirname, $basename;
+        }
+
+        spurt("$destdir/$basename", $contents);
+        chmod 0755, "$destdir/$basename";
     }
 
     my $current = current() or return;
     my ($type) = split '-', $current;
 
-    my @paths = "$prefix/$current/install/bin";
-    if ($type eq 'parrot') {
-        my $parverdir = `$prefix/$current/install/bin/parrot_config versiondir`;
-        chomp $parverdir;
-        push @paths, "$prefix/$current/install/lib/$parverdir/languages/perl6/site/bin";
-    } elsif ($type eq 'jvm') {
-        push @paths, "$prefix/$current/install/languages/perl6/site/bin";
-    } elsif ($type eq 'moar') {
-        push @paths, "$prefix/$current/install/languages/perl6/site/bin";
-    } elsif ($type eq 'moar_jit') {
-        push @paths, "$prefix/$current/install/languages/perl6/site/bin";
-    }
+    my @paths = ("$prefix/$current/install/bin", "$prefix/$current/install/share/perl6/site/bin");
 
     say "Updating shims";
+
+    { # Remove the existing shims.
+        opendir(my $dh, "$prefix/bin");
+        while (my $entry = readdir $dh) {
+            next if $entry =~ /^\./;
+            next if $entry =~ /rakudobrew/;
+            unlink "$prefix/bin/$entry";
+        }
+        closedir $dh;
+    }
+
     my @bins = map { dir($_) } @paths;
-    # TODO: Remove those that were there before?
+
     for (@bins) {
         spurt_shim $_, "$prefix/bin";
     }
@@ -328,4 +412,30 @@ sub rehash {
 sub self_upgrade {
     chdir $prefix;
     run "$GIT pull";
+}
+
+sub test {
+    my $impl = shift;
+    if (!$impl) {
+        $impl = current();
+    }
+    my @match = grep { /\Q$impl/ } list();
+    my ($matched, $ambiguous) = @match;
+    if ($ambiguous) {
+        my ($exact) = grep { $_ eq $impl } @match;
+        if ($exact) {
+            ($matched, $ambiguous) = $exact;
+        }
+    }
+    if ($matched and not $ambiguous) {
+        say "Spectesting $matched";
+        chdir "$prefix/$matched";
+        run "make spectest";
+    } elsif (@match) {
+        say "Sorry, I'm not sure if you mean:";
+        say $_ for @match;
+    } else {
+        say "Sorry, I have no idea what '$impl' is";
+        say "Have you run 'rakudobrew build $impl' yet?";
+    }
 }
